@@ -1,0 +1,387 @@
+%% =========================================================================
+% Simplified Cortical Column Neural Network
+% GitHub: https://github.com/yourusername/simple-cortical-column
+% Author: Your Name
+% Version: 1.0
+% Date: 2024-XX-XX
+% License: MIT
+%
+% Description:
+%   Simplified cortical column network without layer organization.
+%   Each column is treated as a homogeneous functional unit.
+% =========================================================================
+
+clear; close all; clc;
+
+%% 1. PARAMETERS
+fprintf('=== Simplified Cortical Column Network ===\n');
+
+% Network structure
+params.n_columns = 20;              % Number of cortical columns
+params.units_per_column = 50;       % Functional units per column
+params.total_units = params.n_columns * params.units_per_column;
+
+% Column positions (spatial arrangement)
+params.column_spacing = 0.5;        % Distance between columns (mm)
+params.column_diameter = 0.3;       % Column diameter (mm)
+
+% Dynamics parameters
+params.dt = 0.001;                  % Time step (s)
+params.T = 2.0;                     % Simulation duration (s)
+params.tau = 0.015;                 % Time constant (s)
+params.x_threshold = 0.35;          % Activation threshold
+params.x_rest = 0.0;                % Resting potential
+params.beta = 15;                   % Sigmoid steepness
+params.gain = 1.2;                  % Connection gain
+
+% Connectivity parameters
+params.intra_strength = 0.12;       % Intra-column connection strength
+params.inter_strength = 0.08;       % Inter-column connection strength
+params.inhib_strength = -0.15;      % Inhibitory strength
+params.intra_prob = 0.25;           % Intra-column connection probability
+params.inter_prob = 0.15;           % Inter-column connection probability
+params.self_inhibition = -0.05;     % Self-connection strength
+
+% Input parameters
+params.input_strength = 0.1;        % Input signal strength
+params.noise_amplitude = 0.05;      % Noise amplitude
+params.osc_freq_range = [4, 6];     % Oscillation frequency range (Hz)
+params.osc_amplitude = 0.08;        % Oscillation amplitude
+
+%% 2. NETWORK INITIALIZATION
+fprintf('\n1. Initializing network...\n');
+
+% Calculate simulation steps
+n_steps = round(params.T / params.dt);
+fprintf('   Total units: %d\n', params.total_units);
+fprintf('   Simulation steps: %d\n', n_steps);
+fprintf('   Time step: %.3f ms\n', params.dt*1000);
+
+% Create random column positions (2D cortical surface)
+column_positions = randn(params.n_columns, 2) * 5;  % Within 5mm radius
+fprintf('   Column positions generated\n');
+
+%% 3. BUILD CONNECTIVITY MATRIX
+fprintf('\n2. Building connectivity...\n');
+
+% Initialize global weight matrix
+W = zeros(params.total_units, params.total_units);
+
+% Build intra-column connections (within same column)
+for col = 1:params.n_columns
+    col_start = (col-1) * params.units_per_column + 1;
+    col_end = col * params.units_per_column;
+    col_indices = col_start:col_end;
+    
+    % Create dense connections within column
+    intra_mask = rand(params.units_per_column) < params.intra_prob;
+    intra_weights = params.intra_strength * intra_mask;
+    
+    % Add some inhibition (30% of connections are inhibitory)
+    inhib_mask = rand(params.units_per_column) < (params.intra_prob * 0.3);
+    intra_weights(inhib_mask) = params.inhib_strength;
+    
+    % Place in global matrix
+    W(col_indices, col_indices) = intra_weights;
+    
+    % Add self-inhibition
+    for i = col_indices
+        W(i, i) = params.self_inhibition;
+    end
+end
+
+% Build inter-column connections (between different columns)
+for col_i = 1:params.n_columns
+    for col_j = 1:params.n_columns
+        if col_i ~= col_j
+            % Calculate distance between columns
+            distance = norm(column_positions(col_i, :) - column_positions(col_j, :));
+            
+            % Distance-dependent connection probability
+            distance_factor = exp(-distance / 2.0);  % Lower probability for longer distances
+            connection_prob = params.inter_prob * distance_factor;
+            
+            % Create connection mask
+            col_i_start = (col_i-1) * params.units_per_column + 1;
+            col_i_end = col_i * params.units_per_column;
+            col_j_start = (col_j-1) * params.units_per_column + 1;
+            col_j_end = col_j * params.units_per_column;
+            
+            mask = rand(params.units_per_column) < connection_prob;
+            inter_weights = params.inter_strength * mask;
+            
+            % Place into global matrix
+            W(col_j_start:col_j_end, col_i_start:col_i_end) = inter_weights;
+        end
+    end
+end
+
+fprintf('   Connectivity matrix: %d x %d\n', size(W, 1), size(W, 2));
+fprintf('   Connection density: %.1f%%\n', 100*nnz(W)/numel(W));
+
+%% 4. GENERATE INPUT SIGNALS
+fprintf('\n3. Generating inputs...\n');
+
+input_signals = zeros(params.total_units, n_steps);
+
+% Generate input for each unit
+t = (0:n_steps-1) * params.dt;
+
+for unit = 1:params.total_units
+    % Base random input
+    base_input = params.input_strength * randn(1, n_steps);
+    
+    % Oscillatory input (slightly different frequency for each unit)
+    freq = params.osc_freq_range(1) + ...
+           rand() * diff(params.osc_freq_range);
+    osc_input = params.osc_amplitude * sin(2*pi*freq*t);
+    
+    % Noise
+    noise = params.noise_amplitude * randn(1, n_steps);
+    
+    % Combine all inputs
+    input_signals(unit, :) = base_input + osc_input + noise;
+end
+
+fprintf('   Input signals generated\n');
+
+%% 5. SIMULATION
+fprintf('\n4. Running simulation...\n');
+
+% Initialize activity states
+x = params.x_rest * ones(params.total_units, 1);  % Current activity level
+x_history = zeros(params.total_units, n_steps);   % Save history
+s_history = zeros(params.total_units, n_steps);   % Save activation states
+column_activity = zeros(params.n_columns, n_steps); % Column average activity
+
+for t = 1:n_steps
+    % 1. Calculate activation function (Sigmoid)
+    s = 1 ./ (1 + exp(-params.beta * (x - params.x_threshold)));
+    
+    % 2. Save current states
+    x_history(:, t) = x;
+    s_history(:, t) = s;
+    
+    % 3. Calculate average activation rate for each column
+    for col = 1:params.n_columns
+        col_indices = (col-1)*params.units_per_column+1 : col*params.units_per_column;
+        column_activity(col, t) = mean(s(col_indices));
+    end
+    
+    % 4. Network update: dx/dt = (-x + gain * (W*s + input)) / tau + noise
+    network_input = W * s + input_signals(:, t);
+    dx = (-x + params.gain * network_input) / params.tau;
+    
+    % Add noise term
+    noise_term = params.noise_amplitude * randn(params.total_units, 1) * ...
+                 sqrt(params.dt / params.tau);
+    x = x + (dx + noise_term) * params.dt;
+    
+    % 5. Boundary handling
+    x = max(-0.5, min(1.0, x));
+    
+    % 6. Progress display
+    if mod(t, 500) == 0
+        avg_activation = mean(s);
+        fprintf('   Time: %.3f s, Avg activation: %.2f%%\n', ...
+                t*params.dt, 100*avg_activation);
+    end
+end
+
+fprintf('   Simulation completed\n');
+
+%% 6. COMPUTE FIELD POTENTIALS
+fprintf('\n5. Computing field potentials...\n');
+
+% Compute local field potentials (LFP) for each column
+LFP = zeros(params.n_columns, n_steps);
+for col = 1:params.n_columns
+    col_indices = (col-1)*params.units_per_column+1 : col*params.units_per_column;
+    LFP(col, :) = mean(x_history(col_indices, :), 1);
+end
+
+% Compute average LFP (simulated EEG)
+EEG_sim = mean(LFP, 1);
+
+% Apply filter (simulating volume conduction)
+filt_order = 30;
+filt_cutoff = 0.2;
+b = fir1(filt_order, filt_cutoff);
+EEG_sim = filter(b, 1, EEG_sim);
+EEG_sim = EEG_sim - mean(EEG_sim);
+
+fprintf('   Field potentials computed\n');
+
+%% 7. ANALYSIS
+fprintf('\n6. Analyzing results...\n');
+
+% Frequency analysis
+fs = 1 / params.dt;
+[pxx, f] = pwelch(EEG_sim, [], [], [], fs);
+[~, idx] = max(pxx(f >= 1 & f <= 30));
+if ~isempty(idx)
+    dominant_freq = f(f >= 1 & f <= 30);
+    dominant_freq = dominant_freq(idx);
+else
+    dominant_freq = 0;
+end
+
+% Inter-column synchronization analysis
+column_correlations = zeros(params.n_columns, params.n_columns);
+for i = 1:params.n_columns
+    for j = 1:params.n_columns
+        if i ~= j
+            column_correlations(i, j) = corr(column_activity(i, :)', column_activity(j, :)');
+        end
+    end
+end
+avg_synchrony = mean(column_correlations(column_correlations ~= 0));
+
+% Overall statistics
+avg_activity = mean(x_history(:));
+activation_rate = mean(s_history(:) > 0.5);
+
+fprintf('   Dominant frequency: %.2f Hz\n', dominant_freq);
+fprintf('   Average synchrony: %.3f\n', avg_synchrony);
+fprintf('   Mean activity: %.3f\n', avg_activity);
+fprintf('   Activation rate: %.1f%%\n', 100*activation_rate);
+
+%% 8. VISUALIZATION
+fprintf('\n7. Generating visualizations...\n');
+
+figure('Position', [100, 100, 1200, 800], 'Color', 'w');
+
+% 1. Column activity heatmap
+subplot(3, 3, 1);
+imagesc((1:n_steps)*params.dt, 1:params.n_columns, column_activity);
+xlabel('Time (s)'); ylabel('Column');
+title('Column Activity');
+colorbar; clim([0 1]);
+
+% 2. Simulated EEG
+subplot(3, 3, 2);
+plot((1:n_steps)*params.dt, EEG_sim, 'b-', 'LineWidth', 1);
+xlabel('Time (s)'); ylabel('Amplitude');
+title(sprintf('Simulated EEG (%.1f Hz)', dominant_freq));
+grid on;
+
+% 3. Power spectrum
+subplot(3, 3, 3);
+plot(f(f<=50), 10*log10(pxx(f<=50)), 'b-', 'LineWidth', 1.5);
+xlabel('Frequency (Hz)'); ylabel('Power (dB)');
+title('Power Spectrum');
+grid on;
+
+% 4. Column positions
+subplot(3, 3, 4);
+scatter(column_positions(:,1), column_positions(:,2), ...
+        100, mean(column_activity, 2), 'filled');
+xlabel('X (mm)'); ylabel('Y (mm)');
+title('Column Positions');
+colorbar; grid on; axis equal;
+
+% 5. Connectivity matrix
+subplot(3, 3, 5);
+imagesc(W);
+xlabel('Target Unit'); ylabel('Source Unit');
+title('Connectivity Matrix');
+colorbar; axis square;
+
+% 6. Inter-column synchrony matrix
+subplot(3, 3, 6);
+imagesc(column_correlations);
+xlabel('Column'); ylabel('Column');
+title('Inter-column Synchrony');
+colorbar; axis square; clim([-1 1]);
+
+% 7. Unit activity example (first column)
+subplot(3, 3, 7);
+col_to_show = 1;
+col_indices = (col_to_show-1)*params.units_per_column+1 : col_to_show*params.units_per_column;
+plot((1:n_steps)*params.dt, x_history(col_indices(1:5), :));
+xlabel('Time (s)'); ylabel('Activity');
+title(sprintf('Unit Activity (Column %d)', col_to_show));
+grid on; legend('Unit 1', 'Unit 2', 'Unit 3', 'Unit 4', 'Unit 5');
+
+% 8. Activation rate distribution
+subplot(3, 3, 8);
+unit_activation = mean(s_history, 2);
+histogram(unit_activation, 20, 'FaceColor', [0.2, 0.6, 0.8]);
+xlabel('Mean Activation'); ylabel('Count');
+title('Activation Distribution');
+grid on;
+
+% 9. Distance vs Synchrony
+subplot(3, 3, 9);
+distances = zeros(params.n_columns, params.n_columns);
+synchronies = zeros(params.n_columns, params.n_columns);
+all_distances = [];
+all_synchronies = [];
+
+for i = 1:params.n_columns
+    for j = 1:params.n_columns
+        if i ~= j
+            distances(i, j) = norm(column_positions(i,:) - column_positions(j,:));
+            synchronies(i, j) = column_correlations(i, j);
+            all_distances = [all_distances; distances(i, j)];
+            all_synchronies = [all_synchronies; synchronies(i, j)];
+        end
+    end
+end
+
+scatter(all_distances, all_synchronies, 30, 'filled');
+xlabel('Distance (mm)'); ylabel('Synchrony');
+title('Distance vs Synchrony');
+grid on;
+
+% Add fitting line (if sufficient data)
+if length(all_distances) > 2
+    p = polyfit(all_distances, all_synchronies, 1);
+    hold on;
+    x_fit = linspace(min(all_distances), max(all_distances), 100);
+    y_fit = polyval(p, x_fit);
+    plot(x_fit, y_fit, 'r-', 'LineWidth', 2);
+    hold off;
+end
+
+sgtitle('Cortical Column Network Results', 'FontSize', 14, 'FontWeight', 'bold');
+
+% Save figure
+if ~exist('results', 'dir')
+    mkdir('results');
+end
+saveas(gcf, 'results/cortical_column_results.png');
+fprintf('   Figure saved: results/cortical_column_results.png\n');
+
+%% 9. SAVE RESULTS
+fprintf('\n8. Saving results...\n');
+
+results = struct();
+results.params = params;
+results.column_positions = column_positions;
+results.column_activity = column_activity;
+results.EEG_sim = EEG_sim;
+results.dominant_freq = dominant_freq;
+results.avg_synchrony = avg_synchrony;
+results.avg_activity = avg_activity;
+results.activation_rate = activation_rate;
+results.W = W;
+results.timestamp = datestr(now);
+
+save('results/cortical_column_data.mat', 'results');
+fprintf('   Data saved: results/cortical_column_data.mat\n');
+
+%% 10. SUMMARY
+fprintf('\n===========================================\n');
+fprintf('     SIMULATION COMPLETED\n');
+fprintf('===========================================\n');
+fprintf('Network:\n');
+fprintf('  • Columns: %d\n', params.n_columns);
+fprintf('  • Units per column: %d\n', params.units_per_column);
+fprintf('  • Total units: %d\n', params.total_units);
+fprintf('\nResults:\n');
+fprintf('  • Dominant frequency: %.2f Hz\n', dominant_freq);
+fprintf('  • Average synchrony: %.3f\n', avg_synchrony);
+fprintf('  • Activation rate: %.1f%%\n', 100*activation_rate);
+fprintf('\nOutput files saved in /results/\n');
+fprintf('=== END ===\n');
