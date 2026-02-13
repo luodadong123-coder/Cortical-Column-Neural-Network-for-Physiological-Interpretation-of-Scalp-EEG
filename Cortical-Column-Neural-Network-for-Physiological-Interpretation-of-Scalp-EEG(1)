@@ -1,0 +1,625 @@
+%% =========================================================================
+% Cortical Column Neural Network for Scalp EEG Analysis
+% GitHub: https://github.com/luodaong123/Cortical-Column-Neural-Network-for-Physiological-Interpretation-of-Scalp-EEG
+% Author: Dadong Luo (DAITO)
+% Version: 2.0 - EEG-Driven Version
+% Date: 2026-02-13
+% License: MIT
+%
+% Description:
+%   Cortical column network driven by real scalp EEG data.
+%   Each cortical column corresponds to a 10-20 system electrode.
+% =========================================================================
+
+clear; close all; clc;
+
+%% 1. LOAD AND PREPROCESS EEG DATA
+fprintf('=== Cortical Column Network for Scalp EEG Analysis ===\n');
+fprintf('\n1. Loading EEG data...\n');
+
+% ========== 用户配置区：请修改这里的文件路径 ==========
+eeg_filepath = 'your_eeg_data.mat';  % 请修改为您的EEG文件路径
+% ====================================================
+
+% 检查文件是否存在
+if ~exist(eeg_filepath, 'file')
+    error('EEG数据文件不存在！请检查路径: %s\n\n请修改代码中的 eeg_filepath 变量为您的EEG数据路径。', eeg_filepath);
+end
+
+% 加载EEG数据
+loaded_data = load(eeg_filepath);
+
+% --- 根据您的数据结构修改这部分 ---
+% 假设您的数据包含: eeg_data (channels × time), fs (采样率), channel_labels
+% 如果数据结构不同，请在此处修改
+if exist('loaded_data', 'var')
+    if isfield(loaded_data, 'eeg_data')
+        eeg_raw = loaded_data.eeg_data;
+        fs = loaded_data.fs;
+        if isfield(loaded_data, 'channel_labels')
+            channel_labels = loaded_data.channel_labels;
+        else
+            % 默认10-20系统19导联标签
+            channel_labels = {'Fp1','Fp2','F3','F4','C3','C4','P3','P4','O1','O2',...
+                             'F7','F8','T3','T4','T5','T6','Fz','Cz','Pz'};
+        end
+    else
+        % 如果变量名不同，请修改这里
+        error('无法识别EEG数据结构。请修改代码以匹配您的数据格式。');
+    end
+end
+
+% 10-20系统19个标准导联
+n_channels = 19;  % 固定为19导联
+fprintf('   10-20系统导联数量: %d\n', n_channels);
+
+% 检查通道数
+if size(eeg_raw, 1) ~= n_channels
+    warning('EEG数据通道数(%d)与10-20系统19导联不匹配，将自动调整', size(eeg_raw, 1));
+    % 尝试选择前19个通道或进行插值
+    if size(eeg_raw, 1) > n_channels
+        eeg_raw = eeg_raw(1:n_channels, :);
+        channel_labels = channel_labels(1:n_channels);
+    else
+        error('通道数不足19，请提供完整的10-20系统19导联数据');
+    end
+end
+
+% EEG预处理
+fprintf('   预处理EEG数据...\n');
+% 去除线性趋势
+eeg_detrend = detrend(eeg_raw')';
+% 带通滤波 (1-40 Hz)
+[b, a] = butter(4, [1 40]/(fs/2), 'bandpass');
+eeg_filtered = filtfilt(b, a, eeg_detrend')';
+% 基线校正
+eeg_clean = eeg_filtered - mean(eeg_filtered, 2);
+% 标准化（z-score）
+eeg_norm = (eeg_clean - mean(eeg_clean, 2)) ./ std(eeg_clean, 0, 2);
+
+fprintf('   数据维度: %d 通道 × %d 时间点\n', size(eeg_norm, 1), size(eeg_norm, 2));
+fprintf('   采样率: %.1f Hz\n', fs);
+fprintf('   时间长度: %.2f s\n', size(eeg_norm, 2)/fs);
+
+%% 2. PHYSIOLOGICAL PARAMETERS - 基于真实生理数据修改
+fprintf('\n2. 设置生理参数...\n');
+
+% Network structure
+params.n_columns = n_channels;       % 皮层柱数量 = EEG导联数 (19)
+params.units_per_column = 50;        % 每列功能单元数（皮层微柱）
+params.total_units = params.n_columns * params.units_per_column;
+
+% 10-20系统电极位置 (2D投影)
+% 标准10-20系统坐标（简化2D投影）
+params.electrode_positions = [
+    -0.5, 0.8;   % Fp1
+     0.5, 0.8;   % Fp2
+    -0.4, 0.4;   % F3
+     0.4, 0.4;   % F4
+    -0.3, 0.0;   % C3
+     0.3, 0.0;   % C4
+    -0.4, -0.4;  % P3
+     0.4, -0.4;  % P4
+    -0.3, -0.8;  % O1
+     0.3, -0.8;  % O2
+    -0.7, 0.3;   % F7
+     0.7, 0.3;   % F8
+    -0.6, -0.1;  % T3
+     0.6, -0.1;  % T4
+    -0.6, -0.5;  % T5
+     0.6, -0.5;  % T6
+     0.0, 0.5;   % Fz
+     0.0, 0.0;   % Cz
+     0.0, -0.5;  % Pz
+];
+
+params.column_positions = params.electrode_positions;  % 皮层柱对应电极位置
+
+% --- 修改1: column_spacing - 基于10-20系统实际距离 ---
+% 10-20系统相邻电极距离约6-7cm，皮层投影距离约3-3.5cm
+params.column_spacing = 35;          % 皮层柱间距 (mm)，基于10-20系统
+params.column_diameter = 5;          % 皮层柱直径 (mm) - 约500μm×300μm，放大比例
+
+% --- 修改2: x_rest - 静息态皮层柱膜电位 ---
+params.x_rest = -65;                % 静息电位 (mV)，神经元典型静息电位-65mV
+params.x_threshold = -55;           % 激活阈值 (mV)，动作电位阈值
+params.x_initial = -65;            % 初始膜电位 (mV)
+
+% --- 修改3: 动力学参数 - 基于真实神经生理学 ---
+params.tau = 0.020;                % 时间常数 (s)，20ms，符合NMDA受体动力学
+params.beta = 0.5;                % Sigmoid陡度参数 (mV^-1)
+params.gain = 2.5;                % 突触增益
+
+% --- 修改4: 连接强度 - 基于功能连接(FC) ---
+% 注意：这里将在第4步根据实际EEG数据计算FC矩阵
+params.intra_strength = 0.15;      % 柱内连接强度 - 局部微环路
+params.inter_strength_base = 0.08; % 柱间连接基础强度
+params.inhib_strength = -0.20;     % 抑制性连接强度 (GABA能)
+params.self_inhibition = -0.10;    % 自抑制 (回返抑制)
+
+% --- 修改5: 连接概率 - 基于解剖学距离 ---
+params.intra_prob = 0.40;          % 柱内连接概率 - 皮层微柱高度互联
+params.inter_prob_max = 0.25;      % 最大柱间连接概率
+params.inter_prob_min = 0.05;      % 最小柱间连接概率
+params.coupling_distance = 40;     % 耦合距离常数 (mm)
+
+% --- 修改6: 输入参数 - 基于EEG信号强度 ---
+eeg_rms = rms(eeg_norm(:));
+params.input_strength = 0.15 * eeg_rms;  % 输入强度，基于EEG幅度
+params.noise_amplitude = 0.02;           % 噪声幅度（降低）
+params.osc_freq_range = [8, 12];         % 振荡频率范围 (Hz) - alpha频段
+params.osc_amplitude = 0.03;             % 振荡幅度
+
+% 仿真时间参数
+params.T = size(eeg_norm, 2) / fs;        % 仿真时长 = EEG记录时长
+params.dt = 1/fs;                        % 时间步长 = EEG采样间隔
+
+fprintf('   皮层柱数量: %d (对应10-20系统19导联)\n', params.n_columns);
+fprintf('   每列单元数: %d\n', params.units_per_column);
+fprintf('   柱间距: %.1f mm (基于10-20系统)\n', params.column_spacing);
+fprintf('   静息电位: %.1f mV\n', params.x_rest);
+fprintf('   阈值电位: %.1f mV\n', params.x_threshold);
+fprintf('   时间常数: %.0f ms\n', params.tau*1000);
+fprintf('   柱内连接概率: %.0f%%\n', params.intra_prob*100);
+
+%% 3. COMPUTE FUNCTIONAL CONNECTIVITY FROM EEG DATA
+fprintf('\n3. 计算EEG功能连接(FC)...\n');
+
+% 计算各频段的功能连接
+fc_matrices = struct();
+
+% 3.1 全频段功能连接（皮尔逊相关）
+fc_full = corrcoef(eeg_norm');
+fc_full = fc_full - eye(size(fc_full));  % 去除自相关
+fc_matrices.full = fc_full;
+
+% 3.2 频段特异性功能连接
+% 频带定义
+bands = {
+    'delta', [1, 4];
+    'theta', [4, 8];
+    'alpha', [8, 13];
+    'beta',  [13, 30];
+    'gamma', [30, 45]
+};
+
+for i = 1:size(bands, 1)
+    band_name = bands{i, 1};
+    band_range = bands{i, 2};
+    
+    % 带通滤波
+    [b_band, a_band] = butter(4, band_range/(fs/2), 'bandpass');
+    eeg_band = filtfilt(b_band, a_band, eeg_norm')';
+    
+    % 计算该频段FC
+    fc_band = corrcoef(eeg_band');
+    fc_band = fc_band - eye(size(fc_band));
+    fc_matrices.(band_name) = fc_band;
+end
+
+% 3.3 加权功能连接（基于alpha频段，用于连接强度调制）
+fc_alpha = fc_matrices.alpha;
+% 归一化到[0,1]区间
+fc_alpha_norm = (fc_alpha - min(fc_alpha(:))) / (max(fc_alpha(:)) - min(fc_alpha(:)));
+fc_alpha_norm(isnan(fc_alpha_norm)) = 0;
+
+fprintf('   功能连接计算完成\n');
+fprintf('   全频段平均FC: %.3f ± %.3f\n', mean(fc_full(:)), std(fc_full(:)));
+fprintf('   Alpha频段平均FC: %.3f ± %.3f\n', mean(fc_alpha(:)), std(fc_alpha(:)));
+
+%% 4. BUILD CONNECTIVITY MATRIX - 基于FC调制
+fprintf('\n4. 构建连接矩阵...\n');
+
+W = zeros(params.total_units, params.total_units);
+
+% 4.1 构建柱内连接
+for col = 1:params.n_columns
+    col_start = (col-1) * params.units_per_column + 1;
+    col_end = col * params.units_per_column;
+    col_indices = col_start:col_end;
+    
+    % 高密度柱内连接（局部微环路）
+    intra_mask = rand(params.units_per_column) < params.intra_prob;
+    
+    % 兴奋性连接（80%）
+    exc_mask = intra_mask & (rand(params.units_per_column) < 0.8);
+    intra_weights = zeros(params.units_per_column);
+    intra_weights(exc_mask) = params.intra_strength;
+    
+    % 抑制性连接（20%）
+    inh_mask = intra_mask & ~exc_mask;
+    intra_weights(inh_mask) = params.inhib_strength;
+    
+    % 距离依赖性衰减（柱内）
+    [I, J] = ndgrid(1:params.units_per_column, 1:params.units_per_column);
+    unit_distances = abs(I - J) * 0.1;  % 单元间距离
+    distance_decay = exp(-unit_distances / 2);
+    intra_weights = intra_weights .* distance_decay;
+    
+    W(col_indices, col_indices) = intra_weights;
+    
+    % 自抑制
+    for i = col_indices
+        W(i, i) = params.self_inhibition;
+    end
+end
+
+% 4.2 构建柱间连接 - 基于FC和距离调制
+for col_i = 1:params.n_columns
+    for col_j = 1:params.n_columns
+        if col_i ~= col_j
+            % 计算物理距离
+            distance = norm(params.column_positions(col_i, :) - ...
+                          params.column_positions(col_j, :)) * 35; % 转换为mm
+            
+            % 距离依赖性连接概率
+            distance_factor = exp(-distance / params.coupling_distance);
+            connection_prob = params.inter_prob_min + ...
+                            (params.inter_prob_max - params.inter_prob_min) * distance_factor;
+            
+            % FC调制连接强度
+            fc_modulation = fc_alpha_norm(col_i, col_j);
+            
+            % 创建连接
+            col_i_start = (col_i-1) * params.units_per_column + 1;
+            col_i_end = col_i * params.units_per_column;
+            col_j_start = (col_j-1) * params.units_per_column + 1;
+            col_j_end = col_j * params.units_per_column;
+            
+            n_units_i = params.units_per_column;
+            n_units_j = params.units_per_column;
+            
+            mask = rand(n_units_j, n_units_i) < connection_prob;
+            
+            % 连接强度 = 基础强度 × 距离因子 × FC调制
+            inter_weights = params.inter_strength_base * distance_factor * ...
+                          (0.5 + 0.5 * fc_modulation) * mask;
+            
+            W(col_j_start:col_j_end, col_i_start:col_i_end) = inter_weights;
+        end
+    end
+end
+
+fprintf('   连接矩阵维度: %d x %d\n', size(W, 1), size(W, 2));
+fprintf('   连接密度: %.2f%%\n', 100*nnz(W)/numel(W));
+fprintf('   兴奋/抑制比: %.2f\n', sum(W(W>0))/abs(sum(W(W<0))));
+
+%% 5. PREPARE EEG-DRIVEN INPUTS
+fprintf('\n5. 准备EEG驱动输入...\n');
+
+n_steps = size(eeg_norm, 2);
+t = (0:n_steps-1) * params.dt;
+
+input_signals = zeros(params.total_units, n_steps);
+
+% 为每个皮层柱分配对应的EEG信号
+for col = 1:params.n_columns
+    col_indices = (col-1)*params.units_per_column+1 : col*params.units_per_column;
+    
+    % 该导联的EEG信号
+    eeg_channel = eeg_norm(col, :);
+    
+    % 为柱内每个单元生成略有差异的输入
+    for unit_idx = 1:length(col_indices)
+        unit_global_idx = col_indices(unit_idx);
+        
+        % 基础EEG信号（缩放）
+        base_input = params.input_strength * eeg_channel;
+        
+        % 微小延迟差异（模拟传导延迟）
+        delay = randi([0, 5]);  % 0-5个采样点延迟
+        if delay > 0
+            delayed_input = [base_input(delay+1:end), zeros(1, delay)];
+        else
+            delayed_input = base_input;
+        end
+        
+        % 单元特异性调制
+        unit_mod = 0.8 + 0.4 * rand();
+        
+        % 振荡成分（生理节律）
+        freq = params.osc_freq_range(1) + ...
+               rand() * diff(params.osc_freq_range);
+        osc_input = params.osc_amplitude * sin(2*pi*freq*t);
+        
+        % 噪声（降低）
+        noise = params.noise_amplitude * randn(1, n_steps);
+        
+        % 组合输入
+        input_signals(unit_global_idx, :) = unit_mod * delayed_input + ...
+                                           osc_input + noise;
+    end
+end
+
+fprintf('   EEG驱动输入生成完成\n');
+fprintf('   输入信号维度: %d × %d\n', size(input_signals, 1), size(input_signals, 2));
+
+%% 6. SIMULATION
+fprintf('\n6. 运行仿真...\n');
+
+% 初始化状态变量
+x = params.x_rest * ones(params.total_units, 1);  % mV
+x_history = zeros(params.total_units, n_steps);
+s_history = zeros(params.total_units, n_steps);
+column_activity = zeros(params.n_columns, n_steps);
+column_field = zeros(params.n_columns, n_steps);  % 皮层柱场电位
+
+for t_step = 1:n_steps
+    % 1. 激活函数（基于膜电位）
+    % 将mV转换为标准化输入
+    x_norm = (x - params.x_rest) / (params.x_threshold - params.x_rest);
+    s = 1 ./ (1 + exp(-params.beta * (x_norm - 1)));
+    
+    % 2. 保存状态
+    x_history(:, t_step) = x;
+    s_history(:, t_step) = s;
+    
+    % 3. 计算各柱平均活动
+    for col = 1:params.n_columns
+        col_indices = (col-1)*params.units_per_column+1 : col*params.units_per_column;
+        column_activity(col, t_step) = mean(s(col_indices));
+        
+        % 计算场电位（局部场电位，LFP）
+        column_field(col, t_step) = mean(x(col_indices) - params.x_rest);
+    end
+    
+    % 4. 网络更新
+    network_input = W * s + input_signals(:, t_step);
+    dx = (-(x - params.x_rest) + params.gain * network_input) / params.tau;
+    
+    % 离子通道噪声
+    noise_term = params.noise_amplitude * randn(params.total_units, 1);
+    x = x + (dx + noise_term) * params.dt;
+    
+    % 生理边界（防止膜电位异常）
+    x = max(-80, min(-50, x));  % 正常神经元膜电位范围
+    
+    % 进度显示
+    if mod(t_step, round(n_steps/10)) == 0
+        avg_act = mean(s);
+        fprintf('   进度: %.0f%%, 平均激活率: %.2f%%\n', ...
+                100*t_step/n_steps, 100*avg_act);
+    end
+end
+
+fprintf('   仿真完成\n');
+
+%% 7. RECONSTRUCT EEG FROM COLUMN ACTIVITY
+fprintf('\n7. 重建EEG信号...\n');
+
+% 7.1 计算各皮层柱贡献的EEG信号
+reconstructed_eeg = zeros(params.n_columns, n_steps);
+for col = 1:params.n_columns
+    % 皮层柱活动通过容积传导产生头皮电位
+    col_activity = column_field(col, :);
+    
+    % 应用传导模型（简化：低通滤波+衰减）
+    [b_lp, a_lp] = butter(4, 40/(fs/2), 'low');
+    col_potential = filtfilt(b_lp, a_lp, col_activity);
+    
+    % 空间扩散（相邻电极贡献）
+    reconstructed_eeg(col, :) = col_potential * 0.5;  % 衰减因子
+    
+    % 添加相邻柱的贡献
+    for neighbor = 1:params.n_columns
+        if neighbor ~= col
+            dist = norm(params.column_positions(col,:) - ...
+                       params.column_positions(neighbor,:));
+            spatial_factor = exp(-dist^2 / 2);  % 高斯空间扩散
+            reconstructed_eeg(col, :) = reconstructed_eeg(col, :) + ...
+                                      0.2 * spatial_factor * column_field(neighbor, :);
+        end
+    end
+end
+
+% 7.2 归一化
+reconstructed_eeg = reconstructed_eeg - mean(reconstructed_eeg, 2);
+reconstructed_eeg = reconstructed_eeg ./ std(reconstructed_eeg, 0, 2);
+
+% 7.3 计算重建质量
+reconstruction_quality = zeros(params.n_columns, 1);
+for col = 1:params.n_columns
+    reconstruction_quality(col) = corr(eeg_norm(col,:)', reconstructed_eeg(col,:)');
+end
+
+fprintf('   平均重建相关系数: %.3f ± %.3f\n', ...
+        mean(reconstruction_quality), std(reconstruction_quality));
+
+%% 8. ANALYSIS
+fprintf('\n8. 分析结果...\n');
+
+% 8.1 频率分析
+[pxx, f] = pwelch(mean(reconstructed_eeg, 1), [], [], [], fs);
+[~, idx_alpha] = max(pxx(f >= 8 & f <= 13));
+f_alpha = f(f >= 8 & f <= 13);
+dominant_alpha = f_alpha(idx_alpha);
+
+% 8.2 功能连接重建
+fc_reconstructed = corrcoef(reconstructed_eeg');
+fc_reconstructed = fc_reconstructed - eye(size(fc_reconstructed));
+fc_correlation = corr(fc_full(:), fc_reconstructed(:));
+
+% 8.3 相位同步分析
+phase_sync = zeros(params.n_columns, params.n_columns);
+for i = 1:params.n_columns
+    for j = 1:params.n_columns
+        if i < j
+            % Hilbert变换计算瞬时相位
+            hilbert_i = hilbert(reconstructed_eeg(i,:));
+            hilbert_j = hilbert(reconstructed_eeg(j,:));
+            phase_i = angle(hilbert_i);
+            phase_j = angle(hilbert_j);
+            phase_diff = phase_i - phase_j;
+            phase_sync(i,j) = abs(mean(exp(1i*phase_diff)));
+            phase_sync(j,i) = phase_sync(i,j);
+        end
+    end
+end
+
+fprintf('   主导alpha频率: %.2f Hz\n', dominant_alpha);
+fprintf('   FC重建相关性: %.3f\n', fc_correlation);
+fprintf('   平均相位同步: %.3f\n', mean(phase_sync(:)));
+
+%% 9. VISUALIZATION
+fprintf('\n9. 生成可视化...\n');
+
+figure('Position', [50, 50, 1600, 1000], 'Color', 'w');
+
+% 9.1 原始EEG vs 重建EEG
+subplot(4, 4, [1,2]);
+channel_to_plot = 9;  % Cz
+t_plot = (0:n_steps-1)/fs;
+plot(t_plot, eeg_norm(channel_to_plot,:), 'b-', 'LineWidth', 1); hold on;
+plot(t_plot, reconstructed_eeg(channel_to_plot,:), 'r-', 'LineWidth', 1);
+xlabel('Time (s)'); ylabel('Amplitude (a.u.)');
+title(sprintf('原始 vs 重建 EEG (导联: %s)', channel_labels{channel_to_plot}));
+legend('原始EEG', '重建EEG', 'Location', 'best');
+grid on; xlim([0, min(10, params.T)]);
+
+% 9.2 皮层柱活动
+subplot(4, 4, [3,4]);
+imagesc(t_plot, 1:params.n_columns, column_activity);
+xlabel('Time (s)'); ylabel('皮层柱');
+title('皮层柱激活率');
+colorbar; clim([0 1]);
+colormap(gca, 'hot');
+
+% 9.3 10-20系统电极位置
+subplot(4, 4, [5,6]);
+scatter(params.column_positions(:,1), params.column_positions(:,2), ...
+        200, mean(column_activity, 2), 'filled');
+for i = 1:params.n_columns
+    text(params.column_positions(i,1)+0.05, params.column_positions(i,2)+0.05, ...
+         channel_labels{i}, 'FontSize', 10, 'FontWeight', 'bold');
+end
+xlabel('X (cm)'); ylabel('Y (cm)');
+title('皮层柱空间分布与平均激活');
+colorbar; grid on; axis equal; xlim([-1, 1]); ylim([-1, 1]);
+
+% 9.4 功能连接对比
+subplot(4, 4, 7);
+imagesc(fc_full);
+xlabel('电极'); ylabel('电极');
+title('原始EEG功能连接');
+colorbar; clim([-1 1]); axis square;
+
+subplot(4, 4, 8);
+imagesc(fc_reconstructed);
+xlabel('电极'); ylabel('电极');
+title('重建EEG功能连接');
+colorbar; clim([-1 1]); axis square;
+
+% 9.5 相位同步矩阵
+subplot(4, 4, 9);
+imagesc(phase_sync);
+xlabel('电极'); ylabel('电极');
+title('相位同步性');
+colorbar; clim([0 1]); axis square;
+
+% 9.6 功率谱
+subplot(4, 4, 10);
+[pxx_orig, f_orig] = pwelch(mean(eeg_norm,1), [], [], [], fs);
+[pxx_recon, f_recon] = pwelch(mean(reconstructed_eeg,1), [], [], [], fs);
+plot(f_orig, 10*log10(pxx_orig), 'b-', 'LineWidth', 1.5); hold on;
+plot(f_recon, 10*log10(pxx_recon), 'r-', 'LineWidth', 1.5);
+xlabel('Frequency (Hz)'); ylabel('Power (dB)');
+title('功率谱对比');
+legend('原始EEG', '重建EEG');
+grid on; xlim([0, 45]);
+
+% 9.7 重建质量
+subplot(4, 4, [11,12]);
+bar(reconstruction_quality);
+xlabel('电极'); ylabel('相关系数');
+title('EEG重建质量');
+ylim([0, 1]); grid on;
+set(gca, 'XTick', 1:params.n_columns, 'XTickLabel', channel_labels);
+xtickangle(45);
+
+% 9.8 连接矩阵
+subplot(4, 4, 13);
+% 降采样连接矩阵显示
+W_display = W(1:5:end, 1:5:end);
+imagesc(W_display);
+xlabel('单元'); ylabel('单元');
+title('连接矩阵（降采样）');
+colorbar; axis square;
+
+% 9.9 激活分布
+subplot(4, 4, 14);
+unit_activation = mean(s_history, 2);
+histogram(unit_activation, 30, 'FaceColor', [0.2, 0.6, 0.8]);
+xlabel('平均激活率'); ylabel('单元数量');
+title('单元激活分布');
+grid on;
+
+% 9.10 距离-同步关系
+subplot(4, 4, [15,16]);
+distances = pdist(params.column_positions * 35);
+synchrony_values = phase_sync(triu(ones(params.n_columns),1) == 1);
+scatter(distances, synchrony_values, 50, 'filled');
+xlabel('皮层柱距离 (mm)'); ylabel('相位同步');
+title('距离-同步关系');
+grid on; hold on;
+% 拟合曲线
+p = polyfit(distances, synchrony_values, 1);
+x_fit = linspace(min(distances), max(distances), 100);
+y_fit = polyval(p, x_fit);
+plot(x_fit, y_fit, 'r-', 'LineWidth', 2);
+hold off;
+
+sgtitle('皮层柱网络EEG分析结果', 'FontSize', 16, 'FontWeight', 'bold');
+
+% 保存结果
+if ~exist('results', 'dir')
+    mkdir('results');
+end
+saveas(gcf, 'results/cortical_column_eeg_results.png');
+fprintf('   图像保存: results/cortical_column_eeg_results.png\n');
+
+%% 10. SAVE RESULTS
+fprintf('\n10. 保存结果...\n');
+
+results = struct();
+results.params = params;
+results.eeg_original = eeg_norm;
+results.eeg_reconstructed = reconstructed_eeg;
+results.column_activity = column_activity;
+results.column_field = column_field;
+results.fc_original = fc_full;
+results.fc_reconstructed = fc_reconstructed;
+results.phase_sync = phase_sync;
+results.reconstruction_quality = reconstruction_quality;
+results.dominant_frequency = dominant_alpha;
+results.channel_labels = {channel_labels};
+results.W = W;
+results.timestamp = datestr(now);
+
+save('results/cortical_column_eeg_analysis.mat', 'results', '-v7.3');
+fprintf('   数据保存: results/cortical_column_eeg_analysis.mat\n');
+
+%% 11. SUMMARY
+fprintf('\n================================================\n');
+fprintf('    皮层柱网络EEG分析完成\n');
+fprintf('================================================\n');
+fprintf('网络配置:\n');
+fprintf('  • 皮层柱数量: %d (10-20系统19导联)\n', params.n_columns);
+fprintf('  • 每柱单元数: %d\n', params.units_per_column);
+fprintf('  • 柱间距: %.1f mm (基于10-20系统)\n', params.column_spacing);
+fprintf('  • 静息电位: %.1f mV\n', params.x_rest);
+fprintf('  • 阈值电位: %.1f mV\n', params.x_threshold);
+fprintf('\n生理参数:\n');
+fprintf('  • 柱内连接概率: %.0f%%\n', params.intra_prob*100);
+fprintf('  • 柱间连接概率: %.0f-%.0f%% (距离依赖)\n', ...
+        params.inter_prob_min*100, params.inter_prob_max*100);
+fprintf('  • 连接强度: 柱内 %.2f, 柱间 %.2f\n', ...
+        params.intra_strength, params.inter_strength_base);
+fprintf('\n分析结果:\n');
+fprintf('  • 主导alpha频率: %.2f Hz\n', dominant_alpha);
+fprintf('  • 平均重建相关系数: %.3f\n', mean(reconstruction_quality));
+fprintf('  • FC重建相关性: %.3f\n', fc_correlation);
+fprintf('  • 平均相位同步: %.3f\n', mean(phase_sync(:)));
+fprintf('\n输出文件:\n');
+fprintf('  • results/cortical_column_eeg_analysis.mat\n');
+fprintf('  • results/cortical_column_eeg_results.png\n');
+fprintf('\n=== 结束 ===\n');
