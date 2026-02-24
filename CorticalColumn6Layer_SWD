@@ -1,0 +1,1193 @@
+%% =========================================================================
+% 6层皮层柱模型 - 集成真实SWD检测的完整框架
+% 层功能定义：
+%   第1层：EEG微状态输出层
+%   第2层：局部电位循环层（容积传导）
+%   第3层：DTI结构连接层（电极间联系）
+%   第4层：输入层（接收外部输入）
+%   第5层：输出层（主要处理层）
+%   第6层：辅助层（调制第5层）
+% 
+% SWD集成：使用真实检测到的SWD事件进行建模
+% =========================================================================
+
+classdef CorticalColumn6Layer_SWD < handle
+    % 6层皮层柱模型类（集成真实SWD检测）
+    % 每个皮层柱对应一个EEG导联，包含6个功能层
+    
+    properties
+        % 基础参数
+        n_columns           % 皮层柱数量（=EEG导联数）
+        units_per_layer     % 每层单元数
+        total_units        % 总单元数
+        
+        % 层标识
+        LAYER_EEG = 1       % 第1层：EEG输出层
+        LAYER_LFP = 2       % 第2层：局部电位层
+        LAYER_DTI = 3       % 第3层：DTI连接层
+        LAYER_INPUT = 4     % 第4层：输入层
+        LAYER_OUTPUT = 5    % 第5层：输出层
+        LAYER_AUX = 6       % 第6层：辅助层
+        
+        % 生理参数（连续电位，无阈值）
+        v_rest = -65        % 静息电位 (mV)
+        v_min = -80         % 最低电位 (mV)
+        v_max = -50         % 最高电位 (mV)
+        tau = 0.020         % 时间常数 (s)
+        
+        % 层特异性时间常数
+        tau_layer           % 各层时间常数 [6 x 1]
+        
+        % 连接参数
+        W                   % 完整连接矩阵 [total_units x total_units]
+        
+        % 层内连接强度
+        intra_strength = [
+            0.05;    % 层1：弱连接（EEG输出层）
+            0.15;    % 层2：中等连接（局部电位层）
+            0.20;    % 层3：强连接（DTI层）
+            0.10;    % 层4：弱连接（输入层）
+            0.25;    % 层5：强连接（输出层）
+            0.15     % 层6：中等连接（辅助层）
+        ];
+        
+        % 层间连接强度 [6 x 6]
+        inter_strength
+        
+        % DTI连接矩阵（第3层专用）
+        C_dti              % 19x19 DTI结构连接矩阵
+        FA_values          % 各向异性分数
+        
+        % 容积传导参数（第2层专用）
+        volume_conduction_matrix  % 容积传导矩阵
+        
+        % 空间位置
+        column_positions    % 皮层柱位置 [n_columns x 2]
+        channel_labels      % 电极标签
+        
+        % 当前状态
+        v                   % 当前电位 [total_units x 1]
+        v_history          % 电位历史
+        s                   % 激活状态（连续值）
+        
+        % 仿真参数
+        dt                  % 时间步长
+        t                   % 当前时间
+        
+        % 缓存
+        layer_indices       % 各层单元索引
+        column_indices      % 各柱单元索引
+        
+        % ========== SWD相关属性 ==========
+        swd_events          % SWD事件索引（真实检测到的）
+        swd_features        % SWD事件特征
+        swd_exclusion_mask  % SWD排除掩码
+        swd_detection_params % SWD检测参数
+        
+        % SWD调制参数（将SWD视为需要抑制的噪声）
+        swd_suppression_strength = 0.5  % SWD抑制强度
+        swd_suppression_layers = [2, 3, 5]  % 受SWD影响的层（LFP层、DTI层、输出层）
+        
+        % SWD状态记录
+        swd_state_history   % 记录每个时间点是否处于SWD状态
+    end
+    
+    methods
+        %% 构造函数
+        function obj = CorticalColumn6Layer_SWD(n_columns, units_per_layer, dt)
+            % 初始化6层皮层柱模型
+            % 输入：
+            %   n_columns: 皮层柱数量（通常19）
+            %   units_per_layer: 每层单元数（推荐20-50）
+            %   dt: 时间步长 (s)
+            
+            obj.n_columns = n_columns;
+            obj.units_per_layer = units_per_layer;
+            obj.total_units = n_columns * 6 * units_per_layer;
+            obj.dt = dt;
+            obj.t = 0;
+            
+            % 初始化层时间常数
+            obj.tau_layer = obj.tau * [
+                1.5;    % 层1：较慢（EEG整合）
+                1.0;    % 层2：中等（局部电位）
+                0.8;    % 层3：较快（DTI传导）
+                0.5;    % 层4：最快（输入响应）
+                1.0;    % 层5：中等（输出处理）
+                1.2     % 层6：较慢（辅助调制）
+            ];
+            
+            % 初始化层间连接强度矩阵
+            obj.init_inter_strength();
+            
+            % 初始化索引缓存
+            obj.init_indices();
+            
+            % 初始化电位
+            obj.v = obj.v_rest * ones(obj.total_units, 1);
+            obj.s = zeros(obj.total_units, 1);
+            
+            % 初始化SWD相关属性
+            obj.swd_events = [];
+            obj.swd_features = struct();
+            obj.swd_exclusion_mask = [];
+            obj.swd_state_history = [];
+        end
+        
+        %% 初始化层间连接强度
+        function init_inter_strength(obj)
+            % 定义层间连接强度 [源层, 目标层]
+            % 行：源层，列：目标层
+            obj.inter_strength = [
+                % 目标:1   2    3    4    5    6
+                0.00, 0.10, 0.00, 0.00, 0.15, 0.00;   % 源层1 -> 主要连接层5
+                0.20, 0.10, 0.05, 0.00, 0.10, 0.05;   % 源层2 -> 容积传导反馈
+                0.10, 0.15, 0.05, 0.00, 0.20, 0.05;   % 源层3 -> DTI连接主要到层5
+                0.00, 0.00, 0.10, 0.00, 0.30, 0.00;   % 源层4 -> 主要到层5
+                0.20, 0.15, 0.15, 0.10, 0.15, 0.25;   % 源层5 -> 全连接
+                0.10, 0.10, 0.05, 0.00, 0.20, 0.10    % 源层6 -> 主要到层5
+            ];
+        end
+        
+        %% 初始化索引缓存
+        function init_indices(obj)
+            % 为快速访问预计算各层和各柱的索引
+            
+            units_per_column = 6 * obj.units_per_layer;
+            
+            % 按层索引
+            for layer = 1:6
+                layer_start = (layer-1) * obj.units_per_layer + 1;
+                obj.layer_indices{layer} = [];
+                for col = 1:obj.n_columns
+                    col_offset = (col-1) * units_per_column;
+                    obj.layer_indices{layer} = [obj.layer_indices{layer}, ...
+                        col_offset + layer_start : col_offset + layer_start + obj.units_per_layer - 1];
+                end
+            end
+            
+            % 按柱索引
+            for col = 1:obj.n_columns
+                col_start = (col-1) * units_per_column + 1;
+                obj.column_indices{col} = col_start:col_start + units_per_column - 1;
+            end
+        end
+        
+        %% ========== SWD相关方法 ==========
+        
+        %% 加载真实SWD检测结果
+        function loadSWDResults(obj, swd_file)
+            % 从文件加载SWD检测结果
+            % 输入：
+            %   swd_file: SWD检测结果文件 (通常为 'SWD_detection_results.mat')
+            
+            if nargin < 2
+                swd_file = 'SWD_detection_results.mat';
+            end
+            
+            fprintf('加载SWD检测结果: %s\n', swd_file);
+            
+            if exist(swd_file, 'file')
+                load(swd_file, 'SWD_results');
+                
+                if exist('SWD_results', 'var')
+                    % 提取SWD事件信息
+                    if isfield(SWD_results, 'events')
+                        obj.swd_events = SWD_results.events;
+                        fprintf('  ✓ 加载 %d 个SWD事件\n', length(obj.swd_events));
+                    end
+                    
+                    if isfield(SWD_results, 'features')
+                        obj.swd_features = SWD_results.features;
+                    end
+                    
+                    if isfield(SWD_results, 'exclusion_mask')
+                        obj.swd_exclusion_mask = SWD_results.exclusion_mask;
+                    end
+                    
+                    if isfield(SWD_results, 'detection_params')
+                        obj.swd_detection_params = SWD_results.detection_params;
+                    end
+                    
+                    % 显示SWD统计信息
+                    if isfield(SWD_results, 'summary')
+                        fprintf('  SWD统计:\n');
+                        if isfield(SWD_results.summary, 'mean_duration')
+                            fprintf('    平均时长: %.2f 秒\n', SWD_results.summary.mean_duration);
+                        end
+                        if isfield(SWD_results.summary, 'mean_frequency')
+                            fprintf('    平均频率: %.1f Hz\n', SWD_results.summary.mean_frequency);
+                        end
+                        if isfield(SWD_results.summary, 'event_rate')
+                            fprintf('    事件率: %.2f 次/分钟\n', SWD_results.summary.event_rate * 60);
+                        end
+                    end
+                    
+                else
+                    warning('文件中未找到SWD_results结构体');
+                end
+            else
+                error('SWD检测结果文件不存在: %s', swd_file);
+            end
+        end
+        
+        %% 从微状态标签推断SWD事件
+        function inferSWDfromMicrostates(obj, full_labels, srate, swd_states)
+            % 从微状态标签推断可能的SWD事件（备用方法）
+            % 输入：
+            %   full_labels: 微状态标签序列
+            %   srate: 采样率
+            %   swd_states: 可能对应于SWD的微状态
+            
+            fprintf('从微状态推断SWD事件...\n');
+            
+            if nargin < 4
+                swd_states = [];  % 需要外部指定
+            end
+            
+            % 检测快速振荡（SWD特征：2.5-5Hz）
+            window_size = round(0.5 * srate); % 0.5秒窗口
+            step_size = round(0.1 * srate);   % 0.1秒步长
+            n_windows = floor((length(full_labels) - window_size) / step_size) + 1;
+            
+            candidate_events = [];
+            
+            for w = 1:n_windows
+                start_idx = (w-1) * step_size + 1;
+                end_idx = start_idx + window_size - 1;
+                window_labels = full_labels(start_idx:end_idx);
+                
+                % 检查窗口内微状态变化频率
+                state_changes = sum(diff(window_labels) ~= 0);
+                change_rate = state_changes / window_size * srate;
+                
+                % 如果在2.5-5Hz范围内，可能是SWD
+                if change_rate >= 2.5 && change_rate <= 5.0
+                    % 如果指定了SWD相关状态，检查是否主要是这些状态
+                    if ~isempty(swd_states)
+                        dominant_state = mode(window_labels);
+                        if any(dominant_state == swd_states)
+                            candidate_events = [candidate_events, round((start_idx+end_idx)/2)];
+                        end
+                    else
+                        candidate_events = [candidate_events, round((start_idx+end_idx)/2)];
+                    end
+                end
+            end
+            
+            % 合并相近的事件
+            min_interval = round(1.0 * srate);
+            merged_events = [];
+            
+            if ~isempty(candidate_events)
+                candidate_events = sort(candidate_events);
+                current_event = candidate_events(1);
+                
+                for i = 2:length(candidate_events)
+                    if (candidate_events(i) - current_event) <= min_interval
+                        current_event = round((current_event + candidate_events(i)) / 2);
+                    else
+                        merged_events = [merged_events, current_event];
+                        current_event = candidate_events(i);
+                    end
+                end
+                merged_events = [merged_events, current_event];
+            end
+            
+            obj.swd_events = merged_events;
+            fprintf('  推断出 %d 个SWD事件\n', length(obj.swd_events));
+        end
+        
+        %% 设置SWD抑制参数
+        function setSWDSuppression(obj, strength, layers)
+            % 设置SWD抑制参数
+            % 输入：
+            %   strength: 抑制强度 [0,1]
+            %   layers: 受影响的层编号数组
+            
+            if nargin >= 2
+                obj.swd_suppression_strength = max(0, min(1, strength));
+            end
+            if nargin >= 3
+                obj.swd_suppression_layers = layers;
+            end
+            
+            fprintf('SWD抑制参数已更新:\n');
+            fprintf('  抑制强度: %.2f\n', obj.swd_suppression_strength);
+            fprintf('  受影响的层: %s\n', mat2str(obj.swd_suppression_layers));
+        end
+        
+        %% 检查当前时间点是否处于SWD事件
+        function is_swd = isSWDTime(obj, t_idx)
+            % 检查指定时间点是否在SWD事件中
+            % 输入：
+            %   t_idx: 时间点索引
+            % 输出：
+            %   is_swd: 是否在SWD事件中
+            
+            is_swd = false;
+            
+            if ~isempty(obj.swd_events)
+                % SWD事件周围窗口（±0.5秒）
+                if ~isempty(obj.swd_detection_params) && isfield(obj.swd_detection_params, 'match_window')
+                    window = round(obj.swd_detection_params.match_window * 250); % 默认采样率250Hz
+                else
+                    window = round(0.5 * 250); % 默认0.5秒窗口
+                end
+                
+                for i = 1:length(obj.swd_events)
+                    if abs(t_idx - obj.swd_events(i)) <= window
+                        is_swd = true;
+                        break;
+                    end
+                end
+            end
+        end
+        
+        %% ========== DTI和容积传导设置 ==========
+        
+        %% 设置DTI结构连接（第3层专用）
+        function setDTIConnectivity(obj, C_dti, FA_values, column_positions, channel_labels)
+            % 设置DTI结构连接矩阵
+            % 输入：
+            %   C_dti: 19x19 DTI连接矩阵 [0,1]
+            %   FA_values: 19x1 各向异性分数
+            %   column_positions: 皮层柱位置
+            %   channel_labels: 电极标签
+            
+            obj.C_dti = C_dti;
+            obj.FA_values = FA_values;
+            obj.column_positions = column_positions;
+            obj.channel_labels = channel_labels;
+            
+            % 验证维度
+            if size(C_dti, 1) ~= obj.n_columns
+                error('DTI矩阵维度必须等于皮层柱数量');
+            end
+        end
+        
+        %% 设置容积传导矩阵（第2层专用）
+        function setVolumeConduction(obj, spacing, sigma)
+            % 设置容积传导模型（高斯扩散）
+            % 输入：
+            %   spacing: 柱间距 (mm)
+            %   sigma: 空间常数
+            
+            if nargin < 3
+                sigma = spacing;  % 默认空间常数等于间距
+            end
+            
+            obj.volume_conduction_matrix = zeros(obj.n_columns, obj.n_columns);
+            
+            for i = 1:obj.n_columns
+                for j = 1:obj.n_columns
+                    if i == j
+                        obj.volume_conduction_matrix(i, j) = 0.3;  % 自传导
+                    else
+                        dist = norm(obj.column_positions(i, :) - obj.column_positions(j, :));
+                        obj.volume_conduction_matrix(i, j) = 0.2 * exp(-dist^2 / (2 * sigma^2));
+                    end
+                end
+            end
+        end
+        
+        %% 构建完整连接矩阵
+        function buildConnectivity(obj)
+            % 构建6层皮层柱的完整连接矩阵（集成SWD调制）
+            fprintf('构建6层皮层柱连接矩阵（SWD增强版）...\n');
+            
+            units_per_column = 6 * obj.units_per_layer;
+            total_units = obj.n_columns * units_per_column;
+            obj.W = sparse(total_units, total_units);
+            
+            % 为每个皮层柱构建内部连接
+            for col = 1:obj.n_columns
+                col_start = (col-1) * units_per_column + 1;
+                col_end = col * units_per_column;
+                col_indices = col_start:col_end;
+                
+                % 获取该柱的各层索引
+                layer_indices_col = cell(6, 1);
+                for layer = 1:6
+                    layer_start = col_start + (layer-1) * obj.units_per_layer;
+                    layer_indices_col{layer} = layer_start:layer_start + obj.units_per_layer - 1;
+                end
+                
+                % === 构建层内连接 ===
+                for layer = 1:6
+                    layer_idx = layer_indices_col{layer};
+                    n_units = length(layer_idx);
+                    
+                    % 层内随机连接（概率30%）
+                    intra_mask = rand(n_units) < 0.3;
+                    
+                    % 距离衰减
+                    [I, J] = ndgrid(1:n_units, 1:n_units);
+                    unit_dist = abs(I - J) * 0.1;
+                    dist_decay = exp(-unit_dist / 2);
+                    
+                    % 应用连接
+                    intra_W = obj.intra_strength(layer) * intra_mask .* dist_decay;
+                    
+                    % 禁止自连接
+                    intra_W(logical(eye(n_units))) = 0;
+                    
+                    obj.W(layer_idx, layer_idx) = obj.W(layer_idx, layer_idx) + intra_W;
+                end
+                
+                % === 构建层间连接（同一柱内） ===
+                for src_layer = 1:6
+                    for tgt_layer = 1:6
+                        if src_layer ~= tgt_layer && obj.inter_strength(src_layer, tgt_layer) > 0
+                            src_idx = layer_indices_col{src_layer};
+                            tgt_idx = layer_indices_col{tgt_layer};
+                            
+                            n_src = length(src_idx);
+                            n_tgt = length(tgt_idx);
+                            
+                            % 随机连接（概率20%）
+                            inter_mask = rand(n_tgt, n_src) < 0.2;
+                            inter_W = obj.inter_strength(src_layer, tgt_layer) * inter_mask;
+                            
+                            obj.W(tgt_idx, src_idx) = obj.W(tgt_idx, src_idx) + inter_W;
+                        end
+                    end
+                end
+            end
+            
+            % === 构建柱间连接（跨柱） ===
+            fprintf('   构建柱间连接...\n');
+            
+            for col_i = 1:obj.n_columns
+                for col_j = 1:obj.n_columns
+                    if col_i == col_j
+                        continue;
+                    end
+                    
+                    % 物理距离因子
+                    if ~isempty(obj.column_positions)
+                        dist = norm(obj.column_positions(col_i, :) - obj.column_positions(col_j, :));
+                        dist_factor = exp(-dist / 40);  % 40mm特征距离
+                    else
+                        dist_factor = 0.5;
+                    end
+                    
+                    % 第3层：DTI结构连接（如果有）
+                    if ~isempty(obj.C_dti)
+                        dti_factor = obj.C_dti(col_i, col_j);
+                    else
+                        dti_factor = dist_factor;
+                    end
+                    
+                    % 获取柱i和柱j的索引
+                    col_i_start = (col_i-1) * units_per_column + 1;
+                    col_i_end = col_i * units_per_column;
+                    col_i_indices = col_i_start:col_i_end;
+                    
+                    col_j_start = (col_j-1) * units_per_column + 1;
+                    col_j_end = col_j * units_per_column;
+                    col_j_indices = col_j_start:col_j_end;
+                    
+                    % 柱间连接主要发生在：
+                    % 1. 第3层（DTI层）之间：结构连接
+                    % 2. 第5层（输出层）之间：功能连接
+                    % 3. 第2层（LFP层）之间：容积传导
+                    
+                    % 第3层连接（DTI）- SWD影响层
+                    layer3_i = col_i_start + (obj.LAYER_DTI-1)*obj.units_per_layer : ...
+                               col_i_start + obj.LAYER_DTI*obj.units_per_layer - 1;
+                    layer3_j = col_j_start + (obj.LAYER_DTI-1)*obj.units_per_layer : ...
+                               col_j_start + obj.LAYER_DTI*obj.units_per_layer - 1;
+                    
+                    % DTI增强的连接（更强、更稀疏）
+                    if dti_factor > 0.1
+                        mask3 = rand(length(layer3_j), length(layer3_i)) < (0.1 + 0.2*dti_factor);
+                        W3 = 0.15 * dti_factor * mask3;
+                        obj.W(layer3_j, layer3_i) = obj.W(layer3_j, layer3_i) + W3;
+                    end
+                    
+                    % 第5层连接（输出层）- 功能连接
+                    layer5_i = col_i_start + (obj.LAYER_OUTPUT-1)*obj.units_per_layer : ...
+                               col_i_start + obj.LAYER_OUTPUT*obj.units_per_layer - 1;
+                    layer5_j = col_j_start + (obj.LAYER_OUTPUT-1)*obj.units_per_layer : ...
+                               col_j_start + obj.LAYER_OUTPUT*obj.units_per_layer - 1;
+                    
+                    mask5 = rand(length(layer5_j), length(layer5_i)) < (0.05 + 0.1*dist_factor);
+                    W5 = 0.10 * dist_factor * mask5;
+                    obj.W(layer5_j, layer5_i) = obj.W(layer5_j, layer5_i) + W5;
+                    
+                    % 第2层连接（LFP）- 容积传导（SWD影响层）
+                    if ~isempty(obj.volume_conduction_matrix)
+                        vc_factor = obj.volume_conduction_matrix(col_i, col_j);
+                        if vc_factor > 0.01
+                            layer2_i = col_i_start + (obj.LAYER_LFP-1)*obj.units_per_layer : ...
+                                       col_i_start + obj.LAYER_LFP*obj.units_per_layer - 1;
+                            layer2_j = col_j_start + (obj.LAYER_LFP-1)*obj.units_per_layer : ...
+                                       col_j_start + obj.LAYER_LFP*obj.units_per_layer - 1;
+                            
+                            mask2 = rand(length(layer2_j), length(layer2_i)) < 0.3;
+                            W2 = 0.08 * vc_factor * mask2;
+                            obj.W(layer2_j, layer2_i) = obj.W(layer2_j, layer2_i) + W2;
+                        end
+                    end
+                end
+                
+                if mod(col_i, 5) == 0
+                    fprintf('     进度: %d/%d 柱\n', col_i, obj.n_columns);
+                end
+            end
+            
+            fprintf('   连接矩阵维度: %d x %d\n', size(obj.W, 1), size(obj.W, 2));
+            fprintf('   连接密度: %.4f%%\n', 100*nnz(obj.W)/numel(obj.W));
+        end
+        
+        %% 更新网络一步（集成SWD抑制）
+        function [v_new, s_new, swd_status] = update(obj, external_input, t_idx)
+            % 更新网络状态一步（集成SWD抑制）
+            % 输入：
+            %   external_input: 外部输入 [total_units x 1] 或 []
+            %   t_idx: 当前时间点索引（用于检查SWD）
+            % 输出：
+            %   v_new: 更新后电位
+            %   s_new: 更新后激活状态
+            %   swd_status: 当前时间点是否处于SWD
+            
+            % 检查是否处于SWD事件
+            if nargin >= 3 && ~isempty(obj.swd_events)
+                swd_status = obj.isSWDTime(t_idx);
+            else
+                swd_status = false;
+            end
+            
+            % 记录SWD状态
+            obj.swd_state_history = [obj.swd_state_history, swd_status];
+            
+            % 当前激活状态（连续sigmoid，无阈值）
+            v_norm = (obj.v - obj.v_rest) / 15;  % 15mV参考范围
+            obj.s = 1 ./ (1 + exp(-4 * v_norm));  % 连续激活函数
+            
+            % 网络输入
+            if isempty(external_input)
+                network_input = obj.W * obj.s;
+            else
+                network_input = obj.W * obj.s + external_input;
+            end
+            
+            % 层特异性更新
+            dv = zeros(size(obj.v));
+            
+            for layer = 1:6
+                layer_idx = obj.layer_indices{layer};
+                tau_layer = obj.tau_layer(layer);
+                
+                dv(layer_idx) = (-(obj.v(layer_idx) - obj.v_rest) + network_input(layer_idx)) / tau_layer;
+            end
+            
+            % 如果处于SWD状态，对指定层施加抑制
+            if swd_status && ~isempty(obj.swd_suppression_layers)
+                for layer = obj.swd_suppression_layers
+                    layer_idx = obj.layer_indices{layer};
+                    % 抑制：降低电位变化
+                    dv(layer_idx) = dv(layer_idx) * (1 - obj.swd_suppression_strength * 0.5);
+                    
+                    % 增加抑制性输入
+                    inhib_input = -0.1 * obj.swd_suppression_strength * obj.s(layer_idx);
+                    dv(layer_idx) = dv(layer_idx) + inhib_input;
+                end
+            end
+            
+            % 添加噪声（SWD期间噪声略大）
+            if swd_status
+                noise = 0.02 * randn(size(obj.v));  % 标准噪声
+            else
+                noise = 0.01 * randn(size(obj.v));  % 较小噪声
+            end
+            
+            % 更新电位
+            obj.v = obj.v + (dv + noise) * obj.dt;
+            
+            % 限制在生理范围（连续电位，无阈值，只有边界）
+            obj.v = max(obj.v_min, min(obj.v_max, obj.v));
+            
+            % 更新时间
+            obj.t = obj.t + obj.dt;
+            
+            % 输出
+            v_new = obj.v;
+            s_new = obj.s;
+        end
+        
+        %% 获取特定层的活动
+        function layer_activity = getLayerActivity(obj, layer)
+            % 获取指定层的平均活动
+            % 输入：
+            %   layer: 层编号 (1-6)
+            % 输出：
+            %   layer_activity: [n_columns x 1] 各柱该层的平均活动
+            
+            layer_idx = obj.layer_indices{layer};
+            layer_v = obj.v(layer_idx);
+            
+            % 重塑为 [units_per_layer x n_columns]
+            layer_v_reshaped = reshape(layer_v, obj.units_per_layer, obj.n_columns);
+            
+            % 计算每柱平均
+            layer_activity = mean(layer_v_reshaped, 1)';
+        end
+        
+        %% 获取特定柱的活动
+        function column_profile = getColumnProfile(obj, column)
+            % 获取指定柱的6层活动剖面
+            % 输入：
+            %   column: 柱编号
+            % 输出：
+            %   column_profile: [6 x units_per_layer] 该柱各层单元活动
+            
+            col_idx = obj.column_indices{column};
+            col_v = obj.v(col_idx);
+            
+            column_profile = reshape(col_v, 6, obj.units_per_layer);
+        end
+        
+        %% 获取EEG输出（第1层）
+        function eeg_output = getEEGOutput(obj)
+            % 获取第1层输出（模拟头皮EEG）
+            
+            layer1_activity = obj.getLayerActivity(obj.LAYER_EEG);
+            
+            % 应用容积传导得到头皮电位
+            if ~isempty(obj.volume_conduction_matrix)
+                eeg_output = obj.volume_conduction_matrix * layer1_activity;
+            else
+                eeg_output = layer1_activity;
+            end
+            
+            % 归一化
+            eeg_output = (eeg_output - mean(eeg_output)) / (std(eeg_output) + eps);
+        end
+        
+        %% 获取LFP（第2层）
+        function lfp = getLFP(obj)
+            % 获取第2层局部场电位
+            
+            lfp = obj.getLayerActivity(obj.LAYER_LFP);
+        end
+        
+        %% 获取受SWD影响的活动
+        function swd_affected_activity = getSWDAffectedActivity(obj)
+            % 获取受SWD影响层的活动（用于分析）
+            
+            affected_layers = obj.swd_suppression_layers;
+            activity = zeros(obj.n_columns, length(affected_layers));
+            
+            for i = 1:length(affected_layers)
+                activity(:, i) = obj.getLayerActivity(affected_layers(i));
+            end
+            
+            swd_affected_activity = mean(activity, 2);
+        end
+        
+        %% 计算SWD前后的活动变化
+        function [pre_activity, post_activity, changes] = analyzeSWDChanges(obj, swd_indices, pre_window, post_window)
+            % 分析SWD前后活动变化
+            % 输入：
+            %   swd_indices: SWD事件索引
+            %   pre_window: 前窗口大小（样本数）
+            %   post_window: 后窗口大小（样本数）
+            % 输出：
+            %   pre_activity: SWD前活动
+            %   post_activity: SWD后活动
+            %   changes: 变化量
+            
+            if nargin < 3
+                pre_window = 125;  % 0.5秒（250Hz）
+            end
+            if nargin < 4
+                post_window = 125;
+            end
+            
+            n_swd = length(swd_indices);
+            pre_activity = zeros(obj.n_columns, n_swd);
+            post_activity = zeros(obj.n_columns, n_swd);
+            
+            for i = 1:n_swd
+                t_swd = swd_indices(i);
+                
+                % 获取SWD前活动（使用LFP层作为代表）
+                pre_start = max(1, t_swd - pre_window);
+                pre_end = t_swd - 1;
+                
+                % 这里假设有历史记录，否则需要从外部传入
+                if ~isempty(obj.v_history) && pre_end <= size(obj.v_history, 2)
+                    pre_data = obj.v_history(:, pre_start:pre_end);
+                    % 计算每柱平均（简化）
+                    pre_activity(:, i) = mean(reshape(pre_data, 6*obj.units_per_layer, []), 2);
+                end
+                
+                % 获取SWD后活动
+                post_start = t_swd + 1;
+                post_end = min(size(obj.v_history, 2), t_swd + post_window);
+                
+                if ~isempty(obj.v_history) && post_end > post_start
+                    post_data = obj.v_history(:, post_start:post_end);
+                    post_activity(:, i) = mean(reshape(post_data, 6*obj.units_per_layer, []), 2);
+                end
+            end
+            
+            % 计算变化
+            changes = post_activity - pre_activity;
+        end
+        
+        %% 重置网络
+        function reset(obj)
+            obj.v = obj.v_rest * ones(obj.total_units, 1);
+            obj.s = zeros(obj.total_units, 1);
+            obj.t = 0;
+            obj.swd_state_history = [];
+        end
+        
+        %% 保存状态
+        function saveState(obj, filename)
+            state.v = obj.v;
+            state.s = obj.s;
+            state.t = obj.t;
+            state.swd_events = obj.swd_events;
+            state.swd_state_history = obj.swd_state_history;
+            save(filename, 'state');
+        end
+        
+        %% 加载状态
+        function loadState(obj, filename)
+            load(filename, 'state');
+            obj.v = state.v;
+            obj.s = state.s;
+            obj.t = state.t;
+            if isfield(state, 'swd_events')
+                obj.swd_events = state.swd_events;
+            end
+            if isfield(state, 'swd_state_history')
+                obj.swd_state_history = state.swd_state_history;
+            end
+        end
+        
+        %% 可视化皮层柱剖面（包含SWD标记）
+        function plotColumnProfile(obj, column, swd_marker)
+            % 绘制指定柱的6层活动剖面
+            % 输入：
+            %   column: 柱编号
+            %   swd_marker: 是否标记SWD状态
+            
+            if nargin < 3
+                swd_marker = false;
+            end
+            
+            profile = obj.getColumnProfile(column);
+            
+            figure('Position', [100, 100, 800, 400]);
+            
+            subplot(1,2,1);
+            imagesc(profile);
+            colorbar;
+            xlabel('单元');
+            ylabel('层');
+            
+            title_str = sprintf('柱 %d 活动剖面 (%s)', column, obj.channel_labels{column});
+            if swd_marker && ~isempty(obj.swd_state_history) && any(obj.swd_state_history)
+                title_str = [title_str, ' (SWD期间)'];
+            end
+            title(title_str);
+            
+            set(gca, 'YTick', 1:6, 'YTickLabel', {'EEG','LFP','DTI','Input','Output','Aux'});
+            
+            subplot(1,2,2);
+            bar(mean(profile, 2));
+            xlabel('层');
+            ylabel('平均电位 (mV)');
+            title('各层平均活动');
+            set(gca, 'XTick', 1:6, 'XTickLabel', {'EEG','LFP','DTI','Input','Output','Aux'});
+            ylim([obj.v_min, obj.v_max]);
+            grid on;
+        end
+        
+        %% 可视化SWD影响
+        function plotSWDImpact(obj, time_range)
+            % 可视化SWD对各层活动的影响
+            % 输入：
+            %   time_range: 时间范围 [start_idx, end_idx]
+            
+            if isempty(obj.swd_state_history)
+                fprintf('无SWD状态历史记录\n');
+                return;
+            end
+            
+            if nargin < 2
+                time_range = [1, min(5000, length(obj.swd_state_history))];
+            end
+            
+            figure('Position', [100, 100, 1200, 600], 'Color', 'w');
+            
+            % 子图1：SWD状态时间序列
+            subplot(2,1,1);
+            plot(time_range(1):time_range(2), obj.swd_state_history(time_range(1):time_range(2)), 'b-', 'LineWidth', 1.5);
+            xlabel('时间点'); ylabel('SWD状态');
+            title('SWD事件时间序列');
+            ylim([-0.1, 1.1]);
+            grid on;
+            
+            % 子图2：受影响层的平均活动
+            subplot(2,1,2);
+            swd_indices = find(obj.swd_state_history);
+            non_swd_indices = find(~obj.swd_state_history);
+            
+            % 随机抽样以保持数量均衡
+            n_samples = min(1000, min(length(swd_indices), length(non_swd_indices)));
+            if n_samples > 10
+                swd_sample = swd_indices(randperm(length(swd_indices), n_samples));
+                non_swd_sample = non_swd_indices(randperm(length(non_swd_indices), n_samples));
+                
+                % 获取受影响层的活动（简化：使用第5层作为代表）
+                layer5_activity_swd = zeros(n_samples, 1);
+                layer5_activity_non = zeros(n_samples, 1);
+                
+                % 这里需要从历史记录中获取，简化版本跳过
+                bar_data = [mean(layer5_activity_swd), mean(layer5_activity_non)];
+                bar(1:2, bar_data);
+                set(gca, 'XTickLabel', {'SWD期间', '非SWD'});
+                ylabel('平均活动 (mV)');
+                title('SWD对输出层活动的影响');
+                grid on;
+            end
+            
+            sgtitle('SWD影响分析');
+        end
+    end
+end
+
+%% =========================================================================
+% 6层皮层柱模型 - 集成真实SWD检测的使用示例
+% =========================================================================
+
+clear; close all; clc;
+fprintf('=============================================\n');
+fprintf('   6层皮层柱模型 - 集成真实SWD检测\n');
+fprintf('=============================================\n\n');
+
+%% 1. 初始化模型
+fprintf('=== 步骤1: 初始化模型 ===\n');
+
+n_columns = 19;                 % 19个皮层柱（10-20系统）
+units_per_layer = 30;           % 每层30个单元
+dt = 0.004;                     % 时间步长 4ms (250Hz)
+
+% 创建6层皮层柱模型（集成SWD）
+column6 = CorticalColumn6Layer_SWD(n_columns, units_per_layer, dt);
+fprintf('✓ 模型初始化完成\n');
+fprintf('  总单元数: %d\n', column6.total_units);
+
+%% 2. 加载DTI数据
+fprintf('\n=== 步骤2: 加载DTI结构连接 ===\n');
+
+if exist('standard_dti_19channel.mat', 'file')
+    load('standard_dti_19channel.mat', 'dti_structural_connectivity');
+    
+    C_dti = dti_structural_connectivity.connectivity_matrix;
+    FA_values = dti_structural_connectivity.FA_values;
+    
+    % 10-20系统电极位置（转换为mm）
+    electrode_positions = [
+        -0.5, 0.8; 0.5, 0.8; -0.4, 0.4; 0.4, 0.4; -0.3, 0.0;
+        0.3, 0.0; -0.4, -0.4; 0.4, -0.4; -0.3, -0.8; 0.3, -0.8;
+        -0.7, 0.3; 0.7, 0.3; -0.6, -0.1; 0.6, -0.1; -0.6, -0.5;
+        0.6, -0.5; 0.0, 0.5; 0.0, 0.0; 0.0, -0.5
+    ] * 35;
+    
+    channel_labels = {
+        'Fp1','Fp2','F3','F4','C3','C4','P3','P4','O1','O2',...
+        'F7','F8','T3','T4','T5','T6','Fz','Cz','Pz'
+    };
+    
+    % 设置DTI连接
+    column6.setDTIConnectivity(C_dti, FA_values, electrode_positions, channel_labels);
+    
+    % 设置容积传导
+    column6.setVolumeConduction(35, 40);
+    fprintf('✓ DTI和容积传导设置完成\n');
+else
+    warning('未找到DTI文件，使用默认设置');
+end
+
+%% 3. 加载真实SWD检测结果
+fprintf('\n=== 步骤3: 加载SWD检测结果 ===\n');
+
+% 从之前的分析加载SWD结果
+swd_file = 'SWD_detection_results.mat';
+if exist(swd_file, 'file')
+    column6.loadSWDResults(swd_file);
+    
+    % 可选：调整SWD抑制参数
+    column6.setSWDSuppression(0.6, [2, 3, 5]); % 强度0.6，影响LFP、DTI、输出层
+else
+    fprintf('⚠ 未找到SWD结果文件，将使用空SWD列表\n');
+    
+    % 如果有微状态标签，可以尝试推断
+    if exist('microstate_labels.mat', 'file')
+        load('microstate_labels.mat', 'full_labels', 'srate');
+        % 假设状态2和4可能与SWD相关
+        column6.inferSWDfromMicrostates(full_labels, srate, [2, 4]);
+    end
+end
+
+%% 4. 构建连接矩阵
+fprintf('\n=== 步骤4: 构建连接矩阵 ===\n');
+column6.buildConnectivity();
+
+%% 5. 加载微状态标签（用于驱动输入）
+fprintf('\n=== 步骤5: 加载微状态数据 ===\n');
+
+if exist('microstate_labels.mat', 'file')
+    load('microstate_labels.mat', 'full_labels', 'num_microstates', 'srate');
+    fprintf('✓ 加载微状态标签: %d个样本, %d个状态\n', length(full_labels), num_microstates);
+else
+    error('需要微状态标签文件');
+end
+
+%% 6. 运行仿真（集成SWD抑制）
+fprintf('\n=== 步骤6: 运行仿真 ===\n');
+
+n_steps = min(10000, length(full_labels));  % 仿真步数
+eeg_history = zeros(n_columns, n_steps);
+lfp_history = zeros(n_columns, n_steps);
+swd_history = zeros(1, n_steps);
+swd_affected_history = zeros(n_columns, n_steps);
+
+% 记录SWD发生的窗口
+swd_occurrence = zeros(1, n_steps);
+
+fprintf('仿真 %d 步...\n', n_steps);
+
+for step = 1:n_steps
+    % 生成外部输入（基于微状态）
+    external_input = zeros(column6.total_units, 1);
+    
+    % 只给第4层（输入层）添加输入
+    input_layer_idx = column6.layer_indices{column6.LAYER_INPUT};
+    
+    % 基于当前微状态调制输入
+    current_state = full_labels(step);
+    state_factor = 0.5 + 0.5 * (current_state / num_microstates);
+    
+    % 添加输入（包含微状态调制）
+    external_input(input_layer_idx) = state_factor * (2 * randn(length(input_layer_idx), 1));
+    
+    % 检查当前时间点是否在SWD事件中
+    is_swd = column6.isSWDTime(step);
+    if is_swd
+        swd_occurrence(step) = 1;
+    end
+    
+    % 更新网络（传入时间点索引以便应用SWD抑制）
+    [~, ~, swd_status] = column6.update(external_input, step);
+    
+    % 记录数据
+    eeg_history(:, step) = column6.getEEGOutput();
+    lfp_history(:, step) = column6.getLFP();
+    swd_history(step) = swd_status;
+    swd_affected_history(:, step) = column6.getSWDAffectedActivity();
+    
+    if mod(step, 1000) == 0
+        fprintf('  进度: %d/%d\n', step, n_steps);
+    end
+end
+
+fprintf('✓ 仿真完成\n');
+
+%% 7. 结果可视化
+fprintf('\n=== 步骤7: 可视化结果 ===\n');
+
+figure('Position', [50, 50, 1600, 900], 'Color', 'w');
+
+% 子图1: EEG输出和SWD标记
+subplot(3,3,1);
+plot((1:n_steps)*dt, eeg_history(18, :), 'b-', 'LineWidth', 1);
+hold on;
+swd_times = find(swd_occurrence);
+plot(swd_times*dt, eeg_history(18, swd_times), 'r^', ...
+    'MarkerSize', 6, 'MarkerFaceColor', 'r');
+xlabel('时间 (s)'); ylabel('幅度');
+title(sprintf('EEG输出 (Cz) - SWD事件数: %d', sum(swd_occurrence)));
+legend('EEG', 'SWD', 'Location', 'best');
+grid on;
+
+% 子图2: LFP和SWD标记
+subplot(3,3,2);
+plot((1:n_steps)*dt, lfp_history(18, :), 'g-', 'LineWidth', 1);
+hold on;
+plot(swd_times*dt, lfp_history(18, swd_times), 'r^', ...
+    'MarkerSize', 6, 'MarkerFaceColor', 'r');
+xlabel('时间 (s)'); ylabel('幅度');
+title('LFP (Cz)');
+grid on;
+
+% 子图3: 皮层柱剖面
+subplot(3,3,3);
+column6.plotColumnProfile(18, true);
+title('Cz柱活动剖面 (SWD期间)');
+
+% 子图4: SWD受影响层活动
+subplot(3,3,4);
+imagesc(swd_affected_history);
+colorbar;
+xlabel('时间步'); ylabel('皮层柱');
+title('受SWD影响层活动');
+set(gca, 'YTick', 1:n_columns, 'YTickLabel', channel_labels);
+
+% 子图5: SWD前后活动比较
+subplot(3,3,5);
+if sum(swd_occurrence) > 10
+    % 找到SWD前后各10个非SWD点
+    swd_idx = find(swd_occurrence);
+    non_swd_idx = find(~swd_occurrence);
+    
+    % 随机抽样
+    n_samples = min(100, min(length(swd_idx), length(non_swd_idx)));
+    swd_sample = swd_idx(randperm(length(swd_idx), n_samples));
+    non_swd_sample = non_swd_idx(randperm(length(non_swd_idx), n_samples));
+    
+    % 计算平均活动
+    swd_avg = mean(swd_affected_history(:, swd_sample), 2);
+    non_swd_avg = mean(swd_affected_history(:, non_swd_sample), 2);
+    
+    bar_data = [non_swd_avg, swd_avg];
+    bar(1:n_columns, bar_data);
+    xlabel('皮层柱'); ylabel('平均活动');
+    title('SWD vs 非SWD活动比较');
+    legend('非SWD', 'SWD期间', 'Location', 'best');
+    set(gca, 'XTick', 1:n_columns, 'XTickLabel', channel_labels);
+    xtickangle(90);
+else
+    text(0.5, 0.5, 'SWD事件不足', 'HorizontalAlignment', 'center');
+    axis off;
+end
+
+% 子图6: 功能连接矩阵
+subplot(3,3,6);
+fc_matrix = corrcoef(eeg_history');
+imagesc(fc_matrix);
+colorbar; clim([-1,1]);
+xlabel('皮层柱'); ylabel('皮层柱');
+title('EEG功能连接');
+set(gca, 'XTick', 1:n_columns, 'XTickLabel', channel_labels);
+set(gca, 'YTick', 1:n_columns, 'YTickLabel', channel_labels);
+xtickangle(90);
+axis square;
+
+% 子图7: SWD时间分布
+subplot(3,3,7);
+if sum(swd_occurrence) > 0
+    swd_times_sec = find(swd_occurrence) * dt;
+    histogram(swd_times_sec, 20, 'FaceColor', 'r', 'FaceAlpha', 0.7);
+    xlabel('时间 (s)'); ylabel('频数');
+    title('SWD时间分布');
+    grid on;
+else
+    text(0.5, 0.5, '无SWD事件', 'HorizontalAlignment', 'center');
+    axis off;
+end
+
+% 子图8: 各层活动比较
+subplot(3,3,8);
+layer_activity = zeros(6, n_columns);
+for layer = 1:6
+    layer_activity(layer, :) = column6.getLayerActivity(layer);
+end
+imagesc(layer_activity);
+colorbar;
+xlabel('皮层柱'); ylabel('层');
+title('各层活动');
+set(gca, 'XTick', 1:n_columns, 'XTickLabel', channel_labels);
+set(gca, 'YTick', 1:6, 'YTickLabel', {'EEG','LFP','DTI','Input','Output','Aux'});
+xtickangle(90);
+
+% 子图9: 模型信息
+subplot(3,3,9);
+axis off;
+text(0.1, 0.9, '模型配置', 'FontSize', 12, 'FontWeight', 'bold');
+text(0.1, 0.8, sprintf('皮层柱: %d', n_columns));
+text(0.1, 0.7, sprintf('每层单元: %d', units_per_layer));
+text(0.1, 0.6, sprintf('总单元: %d', column6.total_units));
+text(0.1, 0.5, sprintf('SWD事件: %d', sum(swd_occurrence)));
+text(0.1, 0.4, sprintf('SWD抑制强度: %.2f', column6.swd_suppression_strength));
+text(0.1, 0.3, sprintf('受影响层: %s', mat2str(column6.swd_suppression_layers)));
+
+sgtitle('6层皮层柱模型 - 集成真实SWD检测结果');
+
+saveas(gcf, 'CorticalColumn_SWD_Results.png');
+fprintf('✓ 结果图已保存\n');
+
+%% 8. 保存结果
+fprintf('\n=== 步骤8: 保存结果 ===\n');
+
+% 保存仿真结果
+results = struct();
+results.eeg_history = eeg_history;
+results.lfp_history = lfp_history;
+results.swd_history = swd_history;
+results.swd_affected_history = swd_affected_history;
+results.swd_events = column6.swd_events;
+results.params = struct(...
+    'n_columns', n_columns, ...
+    'units_per_layer', units_per_layer, ...
+    'dt', dt, ...
+    'n_steps', n_steps, ...
+    'swd_suppression_strength', column6.swd_suppression_strength, ...
+    'swd_suppression_layers', column6.swd_suppression_layers);
+
+save('CorticalColumn_SWD_Results.mat', 'results', '-v7.3');
+fprintf('✓ 结果已保存到: CorticalColumn_SWD_Results.mat\n');
+
+%% 9. 生成报告
+fprintf('\n=== 步骤9: 生成分析报告 ===\n');
+
+report_file = 'CorticalColumn_SWD_Report.txt';
+fid = fopen(report_file, 'w');
+
+fprintf(fid, '========================================\n');
+fprintf(fid, '   6层皮层柱模型 - SWD集成分析报告\n');
+fprintf(fid, '========================================\n\n');
+fprintf(fid, '生成时间: %s\n\n', datestr(now));
+
+fprintf(fid, '1. 模型配置\n');
+fprintf(fid, '   • 皮层柱数量: %d\n', n_columns);
+fprintf(fid, '   • 每层单元数: %d\n', units_per_layer);
+fprintf(fid, '   • 总单元数: %d\n', column6.total_units);
+fprintf(fid, '   • 时间步长: %.1f ms\n', dt*1000);
+fprintf(fid, '   • 静息电位: %.1f mV\n', column6.v_rest);
+fprintf(fid, '   • 时间常数: %.0f ms\n\n', column6.tau*1000);
+
+fprintf(fid, '2. SWD事件信息\n');
+fprintf(fid, '   • 检测到的SWD事件数: %d\n', length(column6.swd_events));
+fprintf(fid, '   • 仿真中出现的SWD事件数: %d\n', sum(swd_occurrence));
+fprintf(fid, '   • SWD抑制强度: %.2f\n', column6.swd_suppression_strength);
+fprintf(fid, '   • SWD受影响层: %s\n\n', mat2str(column6.swd_suppression_layers));
+
+fprintf(fid, '3. 活动统计\n');
+fprintf(fid, '   • 平均EEG活动: %.3f\n', mean(eeg_history(:)));
+fprintf(fid, '   • 平均LFP活动: %.3f\n', mean(lfp_history(:)));
+fprintf(fid, '   • SWD期间平均活动: %.3f\n', mean(swd_affected_history(swd_occurrence==1)));
+fprintf(fid, '   • 非SWD期间平均活动: %.3f\n\n', mean(swd_affected_history(swd_occurrence==0)));
+
+fprintf(fid, '4. 输出文件\n');
+fprintf(fid, '   • CorticalColumn_SWD_Results.mat - 完整结果数据\n');
+fprintf(fid, '   • CorticalColumn_SWD_Results.png - 可视化结果\n');
+fprintf(fid, '   • %s - 本报告\n', report_file);
+
+fprintf(fid, '\n========================================\n');
+fprintf(fid, '           分析完成\n');
+fprintf(fid, '========================================\n');
+
+fclose(fid);
+fprintf('✓ 报告已保存到: %s\n', report_file);
+
+fprintf('\n=============================================\n');
+fprintf('           全部完成\n');
+fprintf('=============================================\n');
